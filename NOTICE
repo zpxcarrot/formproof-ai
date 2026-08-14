@@ -1,0 +1,7 @@
+FormProof AI / 力证 AI — Experimental MVP
+
+This repository contains an experimental training-video review interface. The
+current public version does not perform real video inference and must not be
+represented as medical, rehabilitation, or injury-diagnosis software.
+
+No real user media or private training records are included in this release.
