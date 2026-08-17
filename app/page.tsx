@@ -1,5 +1,7 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- Reference frames are local canvas data URLs, not network images. */
+
 import { ChangeEvent, DragEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type HistoryItem = {
@@ -26,6 +28,11 @@ type QualityChecks = {
   stableCamera: boolean;
   completeSet: boolean;
   clearView: boolean;
+};
+
+type EvidenceFrame = {
+  time: number;
+  dataUrl: string;
 };
 
 const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
@@ -57,6 +64,17 @@ const movementMuscleGroup: Record<string, string> = {
   侧平举: "肩部",
 };
 
+const cameraGuidance: Record<string, { angle: string; reason: string }> = {
+  杠铃深蹲: { angle: "正侧面或侧后方 30–45°", reason: "同时保留脚、膝、髋与躯干，便于复核深度和膝髋节奏。" },
+  卧推: { angle: "侧前方 30–45°", reason: "让肩、肘、触胸点和脚部支撑同时入镜。" },
+  传统硬拉: { angle: "正侧面或侧前方 30–45°", reason: "更容易看清杠铃与身体距离、髋位和背部线条。" },
+  罗马尼亚硬拉: { angle: "正侧面或侧前方 30–45°", reason: "更容易复核髋部后移、膝部漂移和负重路径。" },
+  坐姿划船: { angle: "侧前方 30–45°", reason: "保留躯干、肩胛与肘部路线，减少器械遮挡。" },
+  高位下拉: { angle: "正前方或后侧前方", reason: "便于同时看到双侧肘部路线、躯干角度和肩部控制。" },
+  肩推: { angle: "侧前方 30–45°", reason: "便于观察肋骨位置、前臂方向和推举路径。" },
+  侧平举: { angle: "正前方或轻微侧前方", reason: "便于比较双侧路线、耸肩代偿和顶部控制。" },
+};
+
 function todayLabel() {
   return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date());
 }
@@ -75,10 +93,15 @@ function formatDuration(seconds: number) {
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const [previewUrl, setPreviewUrl] = useState("");
   const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
   const [fileError, setFileError] = useState("");
   const [qualityChecks, setQualityChecks] = useState<QualityChecks>(emptyQualityChecks);
+  const [playhead, setPlayhead] = useState(0);
+  const [repStart, setRepStart] = useState<number | null>(null);
+  const [repEnd, setRepEnd] = useState<number | null>(null);
+  const [evidenceFrames, setEvidenceFrames] = useState<EvidenceFrame[]>([]);
+  const [capturingFrames, setCapturingFrames] = useState(false);
+  const [frameError, setFrameError] = useState("");
   const [movement, setMovement] = useState("杠铃深蹲");
   const [load, setLoad] = useState("60");
   const [reps, setReps] = useState("8");
@@ -91,9 +114,11 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const reportRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("formproof-history");
+    let nextHistory: HistoryItem[] = [];
     if (stored) {
       try {
         const parsed = JSON.parse(stored) as Partial<HistoryItem>[];
@@ -113,22 +138,20 @@ export default function Home() {
             decision: entry.decision ?? "等待复盘",
           };
         }) : [];
-        setHistory(normalized.slice(0, 24));
+        nextHistory = normalized.slice(0, 24);
       } catch {
         window.localStorage.removeItem("formproof-history");
       }
     }
+    const frame = window.requestAnimationFrame(() => setHistory(nextHistory));
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
+  const previewUrl = useMemo(() => file ? URL.createObjectURL(file) : "", [file]);
+
   useEffect(() => {
-    if (!file) {
-      setPreviewUrl("");
-      return;
-    }
-    const url = URL.createObjectURL(file);
-    setPreviewUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
+    return () => { if (previewUrl) URL.revokeObjectURL(previewUrl); };
+  }, [previewUrl]);
 
   const progression = useMemo(() => {
     if (pain) return { label: "停止当前动作", tone: "danger", copy: "先停止这项动作；若不适持续，请寻求合格的线下教练或医疗专业人员帮助。" };
@@ -145,8 +168,11 @@ export default function Home() {
   const growthGateCount = Math.min(groupSessionCount, 4);
   const growthUnlocked = groupSessionCount >= 4;
   const qualityPassed = Object.values(qualityChecks).every(Boolean);
+  const repDuration = repStart !== null && repEnd !== null ? repEnd - repStart : 0;
+  const repRangeValid = repStart !== null && repEnd !== null && repDuration >= 1 && repDuration <= 15;
+  const evidenceReady = evidenceFrames.length === 4;
   const recordReady = Number(load) > 0 && Number(reps) > 0;
-  const videoReady = !file || Boolean(videoMeta && !fileError && qualityPassed);
+  const videoReady = !file || Boolean(videoMeta && !fileError && qualityPassed && repRangeValid && evidenceReady);
   const analysisDisabled = analyzing || !recordReady || !videoReady;
 
   function resetVideo() {
@@ -154,6 +180,11 @@ export default function Home() {
     setVideoMeta(null);
     setFileError("");
     setQualityChecks(emptyQualityChecks);
+    setPlayhead(0);
+    setRepStart(null);
+    setRepEnd(null);
+    setEvidenceFrames([]);
+    setFrameError("");
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
@@ -175,6 +206,11 @@ export default function Home() {
     setVideoMeta(null);
     setFileError("");
     setQualityChecks(emptyQualityChecks);
+    setPlayhead(0);
+    setRepStart(null);
+    setRepEnd(null);
+    setEvidenceFrames([]);
+    setFrameError("");
     setShowReport(false);
   }
 
@@ -198,6 +234,75 @@ export default function Home() {
 
   function updateQualityCheck(key: keyof QualityChecks, checked: boolean) {
     setQualityChecks((current) => ({ ...current, [key]: checked }));
+  }
+
+  function markRepBoundary(boundary: "start" | "end") {
+    const video = videoRef.current;
+    if (!video || !Number.isFinite(video.currentTime)) return;
+    const time = Math.min(video.currentTime, Math.max(0, video.duration - 0.05));
+    setEvidenceFrames([]);
+    setFrameError("");
+    if (boundary === "start") {
+      setRepStart(time);
+      if (repEnd !== null && repEnd <= time) setRepEnd(null);
+      return;
+    }
+    setRepEnd(time);
+    if (repStart === null) setFrameError("请先在一次重复动作开始时标记起点。");
+    else if (time - repStart < 1 || time - repStart > 15) setFrameError("单次动作区间需为 1–15 秒，请重新标记终点。");
+  }
+
+  function seekVideo(video: HTMLVideoElement, time: number) {
+    return new Promise<void>((resolve, reject) => {
+      if (Math.abs(video.currentTime - time) < 0.02) {
+        resolve();
+        return;
+      }
+      const timeout = window.setTimeout(() => {
+        video.removeEventListener("seeked", onSeeked);
+        reject(new Error("视频定位超时"));
+      }, 4000);
+      function onSeeked() {
+        window.clearTimeout(timeout);
+        resolve();
+      }
+      video.addEventListener("seeked", onSeeked, { once: true });
+      video.currentTime = time;
+    });
+  }
+
+  async function captureEvidenceFrames() {
+    const video = videoRef.current;
+    if (!video || !videoMeta || repStart === null || repEnd === null || !repRangeValid) {
+      setFrameError("请先标记 1–15 秒内的一次完整重复动作。");
+      return;
+    }
+    setCapturingFrames(true);
+    setFrameError("");
+    const originalTime = video.currentTime;
+    const interval = repEnd - repStart;
+    const times = [repStart, repStart + interval / 3, repStart + interval * 2 / 3, repEnd];
+    try {
+      const frames: EvidenceFrame[] = [];
+      for (const time of times) {
+        await seekVideo(video, Math.min(time, Math.max(0, video.duration - 0.05)));
+        const scale = Math.min(1, 720 / video.videoWidth);
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        const context = canvas.getContext("2d");
+        if (!context) throw new Error("浏览器无法创建画面样本");
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        frames.push({ time, dataUrl: canvas.toDataURL("image/jpeg", 0.82) });
+      }
+      setEvidenceFrames(frames);
+      await seekVideo(video, originalTime);
+    } catch {
+      setEvidenceFrames([]);
+      setFrameError("无法从这个视频生成参考帧，请换用 MP4、MOV 或 WebM 后重试。");
+    } finally {
+      setCapturingFrames(false);
+    }
   }
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -337,7 +442,9 @@ export default function Home() {
             >
               <input ref={fileInputRef} type="file" accept="video/mp4,video/quicktime,video/webm,.m4v" onChange={onFileChange} />
               {previewUrl ? (
-                <video src={previewUrl} controls playsInline onLoadedMetadata={onVideoMetadata} aria-label="已选择的视频预览" />
+                // Training clips are expected to contain no speech; controls remain available for any original audio.
+                // eslint-disable-next-line jsx-a11y/media-has-caption
+                <video ref={videoRef} src={previewUrl} controls playsInline onLoadedMetadata={onVideoMetadata} onTimeUpdate={(event) => setPlayhead(event.currentTarget.currentTime)} aria-label="已选择的视频预览" />
               ) : (
                 <div className="drop-copy">
                   <div className="upload-icon" aria-hidden="true"><span>↑</span></div>
@@ -358,13 +465,28 @@ export default function Home() {
               </div>
             )}
             {file && !fileError && videoMeta && (
-              <fieldset className="quality-gate">
-                <legend>提交前确认拍摄质量</legend>
-                <label><input type="checkbox" checked={qualityChecks.fullBody} onChange={(event) => updateQualityCheck("fullBody", event.target.checked)} /><span>全身与器械轨迹完整入镜</span></label>
-                <label><input type="checkbox" checked={qualityChecks.stableCamera} onChange={(event) => updateQualityCheck("stableCamera", event.target.checked)} /><span>镜头固定，没有跟随缩放</span></label>
-                <label><input type="checkbox" checked={qualityChecks.completeSet} onChange={(event) => updateQualityCheck("completeSet", event.target.checked)} /><span>包含一组完整工作组</span></label>
-                <label><input type="checkbox" checked={qualityChecks.clearView} onChange={(event) => updateQualityCheck("clearView", event.target.checked)} /><span>关键关节无遮挡、无旁人重叠</span></label>
-              </fieldset>
+              <>
+                <fieldset className="quality-gate">
+                  <legend>提交前确认拍摄质量</legend>
+                  <label><input type="checkbox" checked={qualityChecks.fullBody} onChange={(event) => updateQualityCheck("fullBody", event.target.checked)} /><span>全身与器械轨迹完整入镜</span></label>
+                  <label><input type="checkbox" checked={qualityChecks.stableCamera} onChange={(event) => updateQualityCheck("stableCamera", event.target.checked)} /><span>镜头固定，没有跟随缩放</span></label>
+                  <label><input type="checkbox" checked={qualityChecks.completeSet} onChange={(event) => updateQualityCheck("completeSet", event.target.checked)} /><span>包含一组完整工作组</span></label>
+                  <label><input type="checkbox" checked={qualityChecks.clearView} onChange={(event) => updateQualityCheck("clearView", event.target.checked)} /><span>关键关节无遮挡、无旁人重叠</span></label>
+                </fieldset>
+                <div className={`rep-selector ${qualityPassed ? "active" : "locked"}`}>
+                  <div className="rep-selector-head"><span>本地证据准备</span><b>当前 {formatDuration(playhead)}</b></div>
+                  <h3>选择一段完整重复动作</h3>
+                  <p>播放视频，在同一次重复动作的开始和结束位置分别标记。系统只生成区间样本，不判断动作阶段。</p>
+                  <div className="rep-actions">
+                    <button type="button" onClick={() => markRepBoundary("start")} disabled={!qualityPassed}>标记起点</button>
+                    <button type="button" onClick={() => markRepBoundary("end")} disabled={!qualityPassed}>标记终点</button>
+                    <button className="capture-button" type="button" onClick={captureEvidenceFrames} disabled={!qualityPassed || !repRangeValid || capturingFrames}>{capturingFrames ? "正在生成…" : evidenceReady ? "重新生成 4 张" : "生成 4 张参考帧"}</button>
+                  </div>
+                  <div className="rep-range"><span>起点 <b>{repStart === null ? "未标记" : formatDuration(repStart)}</b></span><span>终点 <b>{repEnd === null ? "未标记" : formatDuration(repEnd)}</b></span><span>区间 <b>{repRangeValid ? `${repDuration.toFixed(1)} 秒` : "需 1–15 秒"}</b></span></div>
+                  {frameError && <div className="frame-error" role="alert">{frameError}</div>}
+                  {evidenceReady && <div className="frame-strip" aria-label="用户选定区间参考帧">{evidenceFrames.map((frame, index) => <figure key={`${frame.time}-${index}`}><img src={frame.dataUrl} alt={`用户选定区间样本 ${index + 1}`} /><figcaption>样本 {index + 1} · {formatDuration(frame.time)}</figcaption></figure>)}</div>}
+                </div>
+              </>
             )}
             <div className="privacy-note"><span>◉</span><p><b>本地预览</b> — 当前版本不会上传或永久保存视频。</p></div>
           </div>
@@ -382,7 +504,7 @@ export default function Home() {
               <div className="field"><label htmlFor="reps">次数</label><input id="reps" type="number" min="1" max="100" inputMode="numeric" value={reps} onChange={(event) => setReps(event.target.value)} /></div>
               <div className="field"><label htmlFor="rir">剩余次数 <span>RIR</span></label><select id="rir" value={rir} onChange={(event) => setRir(event.target.value)}><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4+</option></select></div>
             </div>
-            <div className="field full"><label htmlFor="angle">拍摄角度</label><select id="angle" value={angle} onChange={(event) => setAngle(event.target.value)}><option>侧前方 45°</option><option>正侧面</option><option>正前方</option><option>正后方</option><option>不确定</option></select></div>
+            <div className="field full"><label htmlFor="angle">拍摄角度</label><select id="angle" value={angle} onChange={(event) => setAngle(event.target.value)}><option>侧前方 45°</option><option>正侧面</option><option>正前方</option><option>正后方</option><option>不确定</option></select><p className="camera-tip"><b>{movement} 推荐：{cameraGuidance[movement].angle}</b><span>{cameraGuidance[movement].reason}</span></p></div>
             <label className={`pain-check ${pain ? "checked" : ""}`}>
               <input type="checkbox" checked={pain} onChange={(event) => setPain(event.target.checked)} />
               <span className="checkbox">{pain ? "✓" : ""}</span>
@@ -391,8 +513,8 @@ export default function Home() {
             <div className={`readiness-card ${file ? (videoReady ? "ready" : "waiting") : "demo"}`} aria-live="polite">
               <span aria-hidden="true">{file ? (videoReady ? "✓" : "!") : "D"}</span>
               <div>
-                <b>{file ? (videoReady ? "视频输入已通过基础检查" : "请完成视频与拍摄质量检查") : "当前为无视频演示模式"}</b>
-                <small>{file ? "这里只确认文件和拍摄条件；动作技术仍未经过真实视觉模型复核。" : "可以体验记录规则与报告结构，不会生成视频技术结论。"}</small>
+                <b>{file ? (videoReady ? "视频与参考帧已准备完成" : "请完成拍摄检查、区间标记与参考帧生成") : "当前为无视频演示模式"}</b>
+                <small>{file ? "这里只确认文件、拍摄条件和用户选定的区间样本；动作技术仍未经过真实视觉模型复核。" : "可以体验记录规则与报告结构，不会生成视频技术结论。"}</small>
               </div>
             </div>
             {!recordReady && <p className="form-error" role="alert">请填写大于 0 的重量和次数。</p>}
@@ -408,7 +530,7 @@ export default function Home() {
         <section className="report-section" ref={reportRef} aria-live="polite">
           <div className="report-topline">
             <div><div className="section-kicker">演示分析报告</div><h2>{movement} · {load || "—"}kg × {reps || "—"}</h2></div>
-            <div className="report-stamp"><small>报告状态</small><strong>DEMO / 非真实识别</strong></div>
+            <div className="report-actions"><button type="button" onClick={() => window.print()}>打印 / 保存 PDF</button><div className="report-stamp"><small>报告状态</small><strong>DEMO / 非真实识别</strong></div></div>
           </div>
 
           <div className="report-summary">
@@ -433,6 +555,14 @@ export default function Home() {
             <em>不包含视频动作技术判断</em>
           </div>
 
+          {evidenceReady && (
+            <div className="frame-report">
+              <div className="frame-report-head"><div><small>本地生成 · 未上传</small><h3>用户选定区间参考帧</h3></div><span>{formatDuration(repStart ?? 0)}–{formatDuration(repEnd ?? 0)}</span></div>
+              <div className="report-frame-grid">{evidenceFrames.map((frame, index) => <figure key={`report-${frame.time}-${index}`}><img src={frame.dataUrl} alt={`用户选定区间参考样本 ${index + 1}`} /><figcaption><b>样本 {index + 1}</b><span>{formatDuration(frame.time)}</span></figcaption></figure>)}</div>
+              <p>这些画面按用户选定区间等距抽取，只用于组织后续复核；它们不代表 AI 已识别起始、下降、底部或返回阶段，也不构成动作技术结论。</p>
+            </div>
+          )}
+
           <div className="evidence-grid">
             <article>
               <div className="evidence-head"><span className="confidence medium">中</span><div><small>用户记录 · 可直接使用</small><h3>训练强度判断</h3></div></div>
@@ -444,13 +574,13 @@ export default function Home() {
               <div className="evidence-head"><span className="confidence low">低</span><div><small>视频证据 · 当前不可判断</small><h3>动作质量检查</h3></div></div>
               <p><b>检查重点：</b>{movementFocus[movement]}。</p>
               <p><b>限制：</b>当前演示没有实际复核视频，因此不评价关节角度、速度或左右差异。</p>
-              <p><b>行动：</b>完成逐帧复核后，从同一次完整重复动作中选择四阶段画面再作判断。</p>
+              <p><b>行动：</b>{evidenceReady ? "已生成同一次用户选定区间的四张参考样本；仍需真实模型或教练完成动作身份与阶段复核。" : "完成逐帧复核后，从同一次完整重复动作中选择可辩护的关键画面再作判断。"}</p>
             </article>
             <article>
               <div className="evidence-head"><span className={`confidence ${file && videoMeta ? "high" : "low"}`}>{file && videoMeta ? "高" : "低"}</span><div><small>拍摄信息 · {file && videoMeta ? "文件可读" : "未提供视频"}</small><h3>下次拍摄建议</h3></div></div>
               <p><b>当前记录：</b>{angle}。</p>
               <p><b>意义：</b>{file && videoMeta ? `已确认文件为 ${videoMeta.height > videoMeta.width ? "竖屏" : "横屏"}、${formatDuration(videoMeta.duration)}；画面是否支持动作判断仍需真实复核。` : "没有视频证据，因此不能评价画面可用性或动作技术。"}</p>
-              <p><b>行动：</b>固定手机、拍全身与器械，并保留动作前后各 1 秒，不要跟随移动镜头。</p>
+              <p><b>行动：</b>优先使用{cameraGuidance[movement].angle}；{cameraGuidance[movement].reason}固定手机、保留动作前后各 1 秒，不要跟随移动镜头。</p>
             </article>
           </div>
 
@@ -495,4 +625,3 @@ export default function Home() {
     </main>
   );
 }
-

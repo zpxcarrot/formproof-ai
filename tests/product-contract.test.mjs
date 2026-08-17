@@ -44,6 +44,16 @@ test("validates video readiness before using an uploaded clip", async () => {
   assert.match(page, /动作技术仍未经过真实视觉模型复核/);
 });
 
+test("prepares local interval samples without claiming phase detection", async () => {
+  const page = await source("app/page.tsx");
+  assert.match(page, /标记起点/);
+  assert.match(page, /标记终点/);
+  assert.match(page, /用户选定区间参考帧/);
+  assert.match(page, /toDataURL\("image\/jpeg"/);
+  assert.match(page, /不代表 AI 已识别起始、下降、底部或返回阶段/);
+  assert.match(page, /window\.print\(\)/);
+});
+
 test("counts distinct same-muscle training days and supports local deletion", async () => {
   const page = await source("app/page.tsx");
   assert.match(page, /new Set\(/);
@@ -65,4 +75,3 @@ test("does not retain starter preview markers", async () => {
   assert.doesNotMatch(layout, /Starter Project|codex-preview/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 });
-
