@@ -33,6 +33,28 @@ test("keeps safety and privacy boundaries visible", async () => {
   assert.match(safety, /停止动作/);
 });
 
+test("validates video readiness before using an uploaded clip", async () => {
+  const page = await source("app/page.tsx");
+  assert.match(page, /MAX_VIDEO_BYTES = 200/);
+  assert.match(page, /MIN_VIDEO_SECONDS = 10/);
+  assert.match(page, /MAX_VIDEO_SECONDS = 60/);
+  assert.match(page, /全身与器械轨迹完整入镜/);
+  assert.match(page, /镜头固定，没有跟随缩放/);
+  assert.match(page, /关键关节无遮挡、无旁人重叠/);
+  assert.match(page, /动作技术仍未经过真实视觉模型复核/);
+});
+
+test("counts distinct same-muscle training days and supports local deletion", async () => {
+  const page = await source("app/page.tsx");
+  assert.match(page, /new Set\(/);
+  assert.match(page, /entry\.muscleGroup === selectedMuscleGroup/);
+  assert.match(page, /entry\.sessionDate/);
+  assert.match(page, /data-growth-state/);
+  assert.match(page, /删除本机记录/);
+  assert.match(page, /removeItem\("formproof-history"\)/);
+  assert.doesNotMatch(page, /history\.filter\(\(entry\) => entry\.movement !== movement\)/);
+});
+
 test("does not retain starter preview markers", async () => {
   const [page, layout, packageJson] = await Promise.all([
     source("app/page.tsx"),
@@ -43,3 +65,4 @@ test("does not retain starter preview markers", async () => {
   assert.doesNotMatch(layout, /Starter Project|codex-preview/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 });
+

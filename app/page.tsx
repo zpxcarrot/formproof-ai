@@ -1,15 +1,37 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, SyntheticEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type HistoryItem = {
   id: number;
   movement: string;
+  muscleGroup: string;
+  sessionDate: string;
   date: string;
   load: string;
   reps: string;
+  rir: string;
   decision: string;
 };
+
+type VideoMeta = {
+  duration: number;
+  width: number;
+  height: number;
+  sizeMb: number;
+};
+
+type QualityChecks = {
+  fullBody: boolean;
+  stableCamera: boolean;
+  completeSet: boolean;
+  clearView: boolean;
+};
+
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+const MIN_VIDEO_SECONDS = 10;
+const MAX_VIDEO_SECONDS = 60;
+const emptyQualityChecks: QualityChecks = { fullBody: false, stableCamera: false, completeSet: false, clearView: false };
 
 const movements = ["杠铃深蹲", "卧推", "传统硬拉", "罗马尼亚硬拉", "坐姿划船", "高位下拉", "肩推", "侧平举"];
 
@@ -24,13 +46,39 @@ const movementFocus: Record<string, string> = {
   侧平举: "目标肌肉路线、耸肩代偿、顶部控制与离心节奏",
 };
 
+const movementMuscleGroup: Record<string, string> = {
+  杠铃深蹲: "腿部",
+  卧推: "胸部",
+  传统硬拉: "后链",
+  罗马尼亚硬拉: "后链",
+  坐姿划船: "背部",
+  高位下拉: "背部",
+  肩推: "肩部",
+  侧平举: "肩部",
+};
+
 function todayLabel() {
   return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date());
+}
+
+function localDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatDuration(seconds: number) {
+  const rounded = Math.round(seconds);
+  return `${Math.floor(rounded / 60)}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
+  const [videoMeta, setVideoMeta] = useState<VideoMeta | null>(null);
+  const [fileError, setFileError] = useState("");
+  const [qualityChecks, setQualityChecks] = useState<QualityChecks>(emptyQualityChecks);
   const [movement, setMovement] = useState("杠铃深蹲");
   const [load, setLoad] = useState("60");
   const [reps, setReps] = useState("8");
@@ -42,12 +90,30 @@ export default function Home() {
   const [showReport, setShowReport] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const reportRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("formproof-history");
     if (stored) {
       try {
-        setHistory(JSON.parse(stored));
+        const parsed = JSON.parse(stored) as Partial<HistoryItem>[];
+        const normalized = Array.isArray(parsed) ? parsed.filter((entry) => entry.movement && entry.id).map((entry) => {
+          const fallbackDate = new Date(Number(entry.id));
+          const safeDate = Number.isNaN(fallbackDate.getTime()) ? new Date() : fallbackDate;
+          const movementName = String(entry.movement);
+          return {
+            id: Number(entry.id),
+            movement: movementName,
+            muscleGroup: entry.muscleGroup ?? movementMuscleGroup[movementName] ?? "其他",
+            sessionDate: entry.sessionDate ?? localDateKey(safeDate),
+            date: entry.date ?? todayLabel(),
+            load: entry.load ?? "未记录",
+            reps: entry.reps ?? "未记录",
+            rir: entry.rir ?? "—",
+            decision: entry.decision ?? "等待复盘",
+          };
+        }) : [];
+        setHistory(normalized.slice(0, 24));
       } catch {
         window.localStorage.removeItem("formproof-history");
       }
@@ -72,10 +138,66 @@ export default function Home() {
     return { label: "可尝试小幅加重", tone: "green", copy: `先在 ${load || "当前"}kg 增加 1–2 次，或下一次增加最小重量档位；不要同时增加重量和组数。` };
   }, [pain, rir, load, reps]);
 
+  const selectedMuscleGroup = movementMuscleGroup[movement];
+  const groupSessionCount = useMemo(() => new Set(
+    history.filter((entry) => entry.muscleGroup === selectedMuscleGroup).map((entry) => entry.sessionDate),
+  ).size, [history, selectedMuscleGroup]);
+  const growthGateCount = Math.min(groupSessionCount, 4);
+  const growthUnlocked = groupSessionCount >= 4;
+  const qualityPassed = Object.values(qualityChecks).every(Boolean);
+  const recordReady = Number(load) > 0 && Number(reps) > 0;
+  const videoReady = !file || Boolean(videoMeta && !fileError && qualityPassed);
+  const analysisDisabled = analyzing || !recordReady || !videoReady;
+
+  function resetVideo() {
+    setFile(null);
+    setVideoMeta(null);
+    setFileError("");
+    setQualityChecks(emptyQualityChecks);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
   function acceptFile(nextFile?: File) {
-    if (!nextFile || !nextFile.type.startsWith("video/")) return;
+    if (!nextFile) return;
+    const hasVideoType = nextFile.type.startsWith("video/");
+    const hasVideoExtension = /\.(mp4|mov|webm|m4v)$/i.test(nextFile.name);
+    if (!hasVideoType && !hasVideoExtension) {
+      resetVideo();
+      setFileError("请选择 MP4、MOV 或 WebM 视频文件。");
+      return;
+    }
+    if (nextFile.size > MAX_VIDEO_BYTES) {
+      resetVideo();
+      setFileError("视频超过 200 MB，请剪取一组完整动作后重新选择。");
+      return;
+    }
     setFile(nextFile);
+    setVideoMeta(null);
+    setFileError("");
+    setQualityChecks(emptyQualityChecks);
     setShowReport(false);
+  }
+
+  function onVideoMetadata(event: SyntheticEvent<HTMLVideoElement>) {
+    const video = event.currentTarget;
+    const meta = {
+      duration: video.duration,
+      width: video.videoWidth,
+      height: video.videoHeight,
+      sizeMb: file ? file.size / 1024 / 1024 : 0,
+    };
+    setVideoMeta(meta);
+    if (!Number.isFinite(video.duration)) {
+      setFileError("无法读取视频信息，请换一个文件后重试。");
+    } else if (video.duration < MIN_VIDEO_SECONDS || video.duration > MAX_VIDEO_SECONDS) {
+      setFileError(`视频时长为 ${formatDuration(video.duration)}，请使用 10–60 秒的一组完整动作。`);
+    } else {
+      setFileError("");
+    }
+  }
+
+  function updateQualityCheck(key: keyof QualityChecks, checked: boolean) {
+    setQualityChecks((current) => ({ ...current, [key]: checked }));
   }
 
   function onFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -89,7 +211,7 @@ export default function Home() {
   }
 
   function loadDemo() {
-    setFile(null);
+    resetVideo();
     setMovement("杠铃深蹲");
     setLoad("60");
     setReps("8");
@@ -100,19 +222,29 @@ export default function Home() {
     document.getElementById("analysis")?.scrollIntoView({ behavior: "smooth" });
   }
 
+  function clearLocalHistory() {
+    if (!window.confirm("删除这台设备上的全部训练摘要？视频从未保存，不受影响。")) return;
+    window.localStorage.removeItem("formproof-history");
+    setHistory([]);
+  }
+
   function runDemoAnalysis() {
+    if (analysisDisabled) return;
     setAnalyzing(true);
     setShowReport(false);
     window.setTimeout(() => {
       const item: HistoryItem = {
         id: Date.now(),
         movement,
+        muscleGroup: selectedMuscleGroup,
+        sessionDate: localDateKey(),
         date: todayLabel(),
         load: load || "未记录",
         reps: reps || "未记录",
+        rir,
         decision: progression.label,
       };
-      const next = [item, ...history.filter((entry) => entry.movement !== movement)].slice(0, 4);
+      const next = [item, ...history].slice(0, 24);
       setHistory(next);
       window.localStorage.setItem("formproof-history", JSON.stringify(next));
       setAnalyzing(false);
@@ -203,9 +335,9 @@ export default function Home() {
               onDragLeave={() => setIsDragging(false)}
               onDrop={onDrop}
             >
-              <input type="file" accept="video/*" onChange={onFileChange} />
+              <input ref={fileInputRef} type="file" accept="video/mp4,video/quicktime,video/webm,.m4v" onChange={onFileChange} />
               {previewUrl ? (
-                <video src={previewUrl} controls playsInline aria-label="已选择的视频预览" />
+                <video src={previewUrl} controls playsInline onLoadedMetadata={onVideoMetadata} aria-label="已选择的视频预览" />
               ) : (
                 <div className="drop-copy">
                   <div className="upload-icon" aria-hidden="true"><span>↑</span></div>
@@ -215,6 +347,25 @@ export default function Home() {
                 </div>
               )}
             </label>
+            {fileError && <div className="file-error" role="alert"><b>视频暂不可用</b><span>{fileError}</span></div>}
+            {file && videoMeta && (
+              <div className="video-meta" aria-label="视频信息">
+                <span><small>时长</small><b>{formatDuration(videoMeta.duration)}</b></span>
+                <span><small>画面</small><b>{videoMeta.width} × {videoMeta.height}</b></span>
+                <span><small>方向</small><b>{videoMeta.height > videoMeta.width ? "竖屏" : "横屏"}</b></span>
+                <span><small>大小</small><b>{videoMeta.sizeMb.toFixed(1)} MB</b></span>
+                <button type="button" onClick={resetVideo}>移除</button>
+              </div>
+            )}
+            {file && !fileError && videoMeta && (
+              <fieldset className="quality-gate">
+                <legend>提交前确认拍摄质量</legend>
+                <label><input type="checkbox" checked={qualityChecks.fullBody} onChange={(event) => updateQualityCheck("fullBody", event.target.checked)} /><span>全身与器械轨迹完整入镜</span></label>
+                <label><input type="checkbox" checked={qualityChecks.stableCamera} onChange={(event) => updateQualityCheck("stableCamera", event.target.checked)} /><span>镜头固定，没有跟随缩放</span></label>
+                <label><input type="checkbox" checked={qualityChecks.completeSet} onChange={(event) => updateQualityCheck("completeSet", event.target.checked)} /><span>包含一组完整工作组</span></label>
+                <label><input type="checkbox" checked={qualityChecks.clearView} onChange={(event) => updateQualityCheck("clearView", event.target.checked)} /><span>关键关节无遮挡、无旁人重叠</span></label>
+              </fieldset>
+            )}
             <div className="privacy-note"><span>◉</span><p><b>本地预览</b> — 当前版本不会上传或永久保存视频。</p></div>
           </div>
 
@@ -227,8 +378,8 @@ export default function Home() {
               </select>
             </div>
             <div className="field-row">
-              <div className="field"><label htmlFor="load">重量 <span>kg</span></label><input id="load" inputMode="decimal" value={load} onChange={(event) => setLoad(event.target.value)} /></div>
-              <div className="field"><label htmlFor="reps">次数</label><input id="reps" inputMode="numeric" value={reps} onChange={(event) => setReps(event.target.value)} /></div>
+              <div className="field"><label htmlFor="load">重量 <span>kg</span></label><input id="load" type="number" min="0.5" step="0.5" inputMode="decimal" value={load} onChange={(event) => setLoad(event.target.value)} /></div>
+              <div className="field"><label htmlFor="reps">次数</label><input id="reps" type="number" min="1" max="100" inputMode="numeric" value={reps} onChange={(event) => setReps(event.target.value)} /></div>
               <div className="field"><label htmlFor="rir">剩余次数 <span>RIR</span></label><select id="rir" value={rir} onChange={(event) => setRir(event.target.value)}><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4+</option></select></div>
             </div>
             <div className="field full"><label htmlFor="angle">拍摄角度</label><select id="angle" value={angle} onChange={(event) => setAngle(event.target.value)}><option>侧前方 45°</option><option>正侧面</option><option>正前方</option><option>正后方</option><option>不确定</option></select></div>
@@ -237,10 +388,18 @@ export default function Home() {
               <span className="checkbox">{pain ? "✓" : ""}</span>
               <span><b>动作过程中有疼痛或明显不适</b><small>开启后，安全建议优先于进阶建议</small></span>
             </label>
-            <button className="analyze-button" onClick={runDemoAnalysis} disabled={analyzing}>
+            <div className={`readiness-card ${file ? (videoReady ? "ready" : "waiting") : "demo"}`} aria-live="polite">
+              <span aria-hidden="true">{file ? (videoReady ? "✓" : "!") : "D"}</span>
+              <div>
+                <b>{file ? (videoReady ? "视频输入已通过基础检查" : "请完成视频与拍摄质量检查") : "当前为无视频演示模式"}</b>
+                <small>{file ? "这里只确认文件和拍摄条件；动作技术仍未经过真实视觉模型复核。" : "可以体验记录规则与报告结构，不会生成视频技术结论。"}</small>
+              </div>
+            </div>
+            {!recordReady && <p className="form-error" role="alert">请填写大于 0 的重量和次数。</p>}
+            <button className="analyze-button" onClick={runDemoAnalysis} disabled={analysisDisabled}>
               {analyzing ? <><i className="spinner" /> 正在整理训练证据…</> : <>生成演示报告 <span>→</span></>}
             </button>
-            <p className="demo-disclaimer">未选择视频也可体验。报告内容用于演示产品结构，不代表已分析你的动作。</p>
+            <p className="demo-disclaimer">报告只使用你填写的训练记录和拍摄信息；当前不会生成关节角度、速度、次数识别或动作纠错结论。</p>
           </div>
         </div>
       </section>
@@ -263,9 +422,15 @@ export default function Home() {
 
           <div className="identity-bar">
             <span><small>用户填写动作</small><b>{movement}</b></span>
-            <span><small>实际观察动作</small><b>未进行视频复核</b></span>
+            <span><small>实际观察动作</small><b>尚未进行视觉复核</b></span>
             <span><small>身份匹配</small><b>无法判断</b></span>
             <span><small>整体证据置信度</small><b>低 · 演示模式</b></span>
+          </div>
+          <div className="report-source">
+            <b>本报告依据：</b>
+            <span>用户填写的重量、次数、RIR 与疼痛信息</span>
+            <span>{file && videoMeta ? `文件元数据（${formatDuration(videoMeta.duration)}，${videoMeta.width} × ${videoMeta.height}）` : "未选择视频"}</span>
+            <em>不包含视频动作技术判断</em>
           </div>
 
           <div className="evidence-grid">
@@ -282,9 +447,9 @@ export default function Home() {
               <p><b>行动：</b>完成逐帧复核后，从同一次完整重复动作中选择四阶段画面再作判断。</p>
             </article>
             <article>
-              <div className="evidence-head"><span className="confidence high">高</span><div><small>拍摄信息 · 直接证据</small><h3>下次拍摄建议</h3></div></div>
+              <div className="evidence-head"><span className={`confidence ${file && videoMeta ? "high" : "low"}`}>{file && videoMeta ? "高" : "低"}</span><div><small>拍摄信息 · {file && videoMeta ? "文件可读" : "未提供视频"}</small><h3>下次拍摄建议</h3></div></div>
               <p><b>当前记录：</b>{angle}。</p>
-              <p><b>意义：</b>能否同时看清主要关节、负重路径和支撑点，决定报告可信度。</p>
+              <p><b>意义：</b>{file && videoMeta ? `已确认文件为 ${videoMeta.height > videoMeta.width ? "竖屏" : "横屏"}、${formatDuration(videoMeta.duration)}；画面是否支持动作判断仍需真实复核。` : "没有视频证据，因此不能评价画面可用性或动作技术。"}</p>
               <p><b>行动：</b>固定手机、拍全身与器械，并保留动作前后各 1 秒，不要跟随移动镜头。</p>
             </article>
           </div>
@@ -294,14 +459,21 @@ export default function Home() {
       )}
 
       <section className="history-section">
-        <div className="history-heading"><div><div className="section-kicker">本机训练记录</div><h2>让下一次建议接得上这一次</h2></div><span>{history.length}/4 次记录</span></div>
+        <div className="history-heading">
+          <div><div className="section-kicker">本机训练记录</div><h2>让下一次建议接得上这一次</h2></div>
+          <div className="history-actions"><span>{selectedMuscleGroup} · {growthGateCount}/4 个训练日</span>{history.length > 0 && <button type="button" onClick={clearLocalHistory}>删除本机记录</button>}</div>
+        </div>
         <div className="history-grid">
-          {history.length ? history.map((item) => (
-            <article key={item.id}><small>{item.date}</small><h3>{item.movement}</h3><div><span>{item.load}kg × {item.reps}</span><b>{item.decision}</b></div></article>
+          {history.length ? history.slice(0, 3).map((item) => (
+            <article key={item.id}><small>{item.date} · {item.muscleGroup}</small><h3>{item.movement}</h3><div><span>{item.load}kg × {item.reps} · RIR {item.rir}</span><b>{item.decision}</b></div></article>
           )) : (
             <div className="empty-history"><span>＋</span><p>完成第一份演示报告后，训练摘要会仅保存在这台设备上。</p></div>
           )}
-          <div className="growth-gate"><small>趋势解锁规则</small><strong>{history.length}/4</strong><p>同一动作完成 4 次记录后，才开始讨论稳定趋势；不会用一次训练推断肌肉增长。</p></div>
+          <div className="growth-gate" data-growth-state={growthUnlocked ? "unlocked" : "locked"} data-growth-session-count={groupSessionCount} data-growth-trigger-count="4">
+            <small>{selectedMuscleGroup}训练趋势</small>
+            <strong>{growthUnlocked ? "已解锁" : `${growthGateCount}/4`}</strong>
+            <p>{growthUnlocked ? "已完成 4 个不同训练日，可开始比较可比动作与训练记录；这仍不等于测得肌肉增长。" : `同一用户、同一肌群在 4 个不同日期完成训练后才解锁，当前 ${growthGateCount}/4。`}</p>
+          </div>
         </div>
       </section>
 
@@ -323,3 +495,4 @@ export default function Home() {
     </main>
   );
 }
+
